@@ -7,8 +7,8 @@ English U.S.-listed climate-finance research cockpit inspired by the earlier Chi
 - U.S.-listed sector ETF allocation dashboard
 - Daily climate-alert overlay that moves current ETF allocation from NWS active weather alerts
 - Climate signal from temperature anomaly and weather disaster frequency proxies
-- Climate-aware vs equal-weight ETF backtest
-- Visible model backtest dashboard with equity curve, risk metrics, annual walk-forward results, and methodology notes
+- Recommended portfolio backtest using the final optimizer weights
+- Visible backtest dashboard with equity curve, risk metrics, annual results, and methodology notes
 - Portfolio CVOR scenario matrix
 - Company-level issuer scanner for market CVaR and climate value-at-risk components
 - U.S. listed company search from NasdaqTrader listings
@@ -70,6 +70,8 @@ The optimizer is designed for an asset-investor workflow:
 - `Low volatility`: reduces high-volatility and high-tail-risk exposure
 
 For each asset, the optimizer estimates a score from market behavior, climate risk, and volatility, then converts it into a portfolio weight. It multiplies the weight by the selected capital amount to show target dollars and estimated shares.
+
+The backtest section now uses those final optimizer weights as the model portfolio and compares them with an equal-weight basket of the same selected assets. This makes the backtest match the actual recommendation shown by the system. It is a current-recommendation backtest, not a pure historical walk-forward test, because today's weights are applied backward through history.
 
 ## Climate Data Sources
 

@@ -1664,6 +1664,8 @@ def portfolio_optimizer_payload(mode="etf_stock", capital=None, horizon="long", 
     for row in rows:
         row.pop("raw_weight", None)
 
+    backtest_rows, backtest_summary, backtest_methodology = recommended_portfolio_backtest(rows, capital_value)
+
     return {
         "generated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         "mode": mode,
@@ -1684,6 +1686,9 @@ def portfolio_optimizer_payload(mode="etf_stock", capital=None, horizon="long", 
             else "Long-term mode uses recent daily trend, Method 2 CVOR, and structural climate resilience."
         ),
         "rows": rows,
+        "backtest_rows": backtest_rows,
+        "backtest_summary": backtest_summary,
+        "backtest_methodology": backtest_methodology,
     }
 
 
@@ -1886,6 +1891,205 @@ def simulated_annual_returns(tickers):
             tilt = {"XLE": -0.005, "XLU": 0.012, "XLI": 0.003, "XLK": 0.025, "XLF": 0.006}.get(t, 0)
             annual[t][str(year)] = round(market * beta + tilt + rng.gauss(0, 0.06), 5)
     return annual
+
+
+def extract_close_series(data, symbol, symbols):
+    if data is None or not hasattr(data, "columns"):
+        return None
+    columns = data.columns
+    try:
+        if getattr(columns, "nlevels", 1) > 1:
+            level0 = set(columns.get_level_values(0))
+            level1 = set(columns.get_level_values(1))
+            if "Close" in level0:
+                close_frame = data["Close"]
+                if hasattr(close_frame, "columns") and symbol in close_frame.columns:
+                    return close_frame[symbol]
+                if len(symbols) == 1:
+                    return close_frame
+            if symbol in level0:
+                frame = data[symbol]
+                if hasattr(frame, "columns") and "Close" in frame.columns:
+                    return frame["Close"]
+            if "Close" in level1:
+                for key in [(symbol, "Close"), ("Close", symbol)]:
+                    try:
+                        return data[key]
+                    except Exception:
+                        continue
+        if "Close" in columns:
+            close = data["Close"]
+            if hasattr(close, "columns") and symbol in close.columns:
+                return close[symbol]
+            return close
+        if symbol in columns:
+            return data[symbol]
+    except Exception:
+        return None
+    return None
+
+
+def fetch_annual_market_returns(tickers, cache_name="optimizer_backtest_returns_cache.json", start=f"{START_YEAR}-01-01"):
+    symbols = []
+    for raw in tickers:
+        symbol = yahoo_symbol(raw)
+        if symbol and symbol not in symbols:
+            symbols.append(symbol)
+    if not symbols:
+        return {}, "no symbols"
+
+    cache = DATA_DIR / cache_name
+    annual = {}
+    source = None
+    if yf is not None:
+        try:
+            data = yf.download(symbols, start=start, auto_adjust=True, progress=False, threads=True)
+            if data is not None and not data.empty:
+                for symbol in symbols:
+                    series = extract_close_series(data, symbol, symbols)
+                    if series is None and len(symbols) == 1 and "Close" in data:
+                        series = data["Close"]
+                    if series is None or not hasattr(series, "dropna"):
+                        continue
+                    series = series.dropna()
+                    if len(series) > 30 and hasattr(series, "resample"):
+                        yearly = series.resample("YE").last().pct_change().dropna()
+                        if len(yearly):
+                            annual[symbol] = {str(idx.year): round(float(v), 5) for idx, v in yearly.items()}
+                if annual:
+                    cache.write_text(json.dumps(annual, indent=2), encoding="utf-8")
+                    source = "yfinance historical annual returns"
+        except Exception:
+            annual = {}
+
+    if not annual and cache.exists():
+        try:
+            cached = json.loads(cache.read_text(encoding="utf-8"))
+            annual = {symbol: cached.get(symbol, {}) for symbol in symbols if cached.get(symbol)}
+            if annual:
+                source = "cached historical annual returns"
+        except Exception:
+            annual = {}
+
+    simulated = simulated_annual_returns(symbols)
+    missing = [symbol for symbol in symbols if not annual.get(symbol)]
+    for symbol in missing:
+        annual[symbol] = simulated.get(symbol, {})
+    if missing:
+        source = (source + " plus deterministic fallback") if source else "deterministic simulated market data"
+    return annual, source or "deterministic simulated market data"
+
+
+def recommended_backtest_summary(backtest_rows):
+    model_ret = [r["recommended_return"] for r in backtest_rows]
+    model_wealth = [r["recommended_wealth"] for r in backtest_rows]
+    bench_wealth = [r["benchmark_wealth"] for r in backtest_rows]
+    mean = sum(model_ret) / max(1, len(model_ret))
+    vol = math.sqrt(sum((x - mean) ** 2 for x in model_ret) / max(1, len(model_ret) - 1))
+    sharpe = mean / vol if vol > 1e-9 else 0
+    ending_model = model_wealth[-1] if model_wealth else 1
+    ending_bench = bench_wealth[-1] if bench_wealth else 1
+    years = len(backtest_rows)
+    annualized = ending_model ** (1 / years) - 1 if years and ending_model > 0 else 0
+    return {
+        "recommended_total_return": round(ending_model - 1, 4),
+        "climate_total_return": round(ending_model - 1, 4),
+        "benchmark_total_return": round(ending_bench - 1, 4),
+        "excess_return": round(ending_model - ending_bench, 4),
+        "excess_wealth_ratio": round(ending_model / ending_bench, 4) if ending_bench else 0,
+        "recommended_max_drawdown": round(max_drawdown(model_wealth), 4),
+        "climate_max_drawdown": round(max_drawdown(model_wealth), 4),
+        "benchmark_max_drawdown": round(max_drawdown(bench_wealth), 4),
+        "annualized_return": round(annualized, 4),
+        "annual_sharpe_proxy": round(sharpe, 3),
+        "winning_years": sum(1 for r in backtest_rows if r["return_difference"] > 0),
+        "years_tested": years,
+    }
+
+
+def recommended_portfolio_backtest(optimizer_rows, capital_value):
+    weights = {}
+    for row in optimizer_rows or []:
+        symbol = yahoo_symbol(row.get("ticker"))
+        weight = safe_float(row.get("target_weight"), 0.0)
+        if symbol and weight > 0:
+            weights[symbol] = weights.get(symbol, 0.0) + weight
+    total_weight = sum(weights.values())
+    if total_weight <= 0:
+        return [], recommended_backtest_summary([]), {
+            "universe": "-",
+            "benchmark": "Equal-weight selected assets",
+            "model": "No optimizer weights available.",
+            "rebalance": "Uses the final optimizer recommendation.",
+            "caveat": "No recommended portfolio was available for backtesting.",
+        }
+
+    weights = {symbol: weight / total_weight for symbol, weight in weights.items()}
+    symbols = list(weights.keys())
+    returns, source = fetch_annual_market_returns(symbols)
+    years = sorted({int(year) for symbol_returns in returns.values() for year in symbol_returns if int(year) >= START_YEAR})
+    regimes = climate_signal()
+    recommended_wealth = 1.0
+    benchmark_wealth = 1.0
+    rows = []
+
+    for year in years:
+        year_key = str(year)
+        available = [symbol for symbol in symbols if year_key in returns.get(symbol, {})]
+        if not available:
+            continue
+        available_weight = sum(weights[symbol] for symbol in available)
+        if available_weight <= 0:
+            continue
+        model_return = sum(
+            (weights[symbol] / available_weight) * safe_float(returns[symbol].get(year_key), 0.0)
+            for symbol in available
+        )
+        benchmark_return = sum(safe_float(returns[symbol].get(year_key), 0.0) for symbol in available) / len(available)
+        recommended_wealth *= 1 + model_return
+        benchmark_wealth *= 1 + benchmark_return
+        regime = regime_for_year(year, regimes)
+        top_contributors = sorted(
+            (
+                (
+                    symbol,
+                    (weights[symbol] / available_weight) * safe_float(returns[symbol].get(year_key), 0.0),
+                )
+                for symbol in available
+            ),
+            key=lambda item: item[1],
+            reverse=True,
+        )[:3]
+        rows.append(
+            {
+                "year": year,
+                "signal_year": regime["signal_year"],
+                "regime": regime["regime"],
+                "climate_score": regime["score"],
+                "recommended_return": round(model_return, 5),
+                "benchmark_return": round(benchmark_return, 5),
+                "return_difference": round(model_return - benchmark_return, 5),
+                "recommended_wealth": round(recommended_wealth, 4),
+                "benchmark_wealth": round(benchmark_wealth, 4),
+                "recommended_value": round(recommended_wealth * capital_value, 2),
+                "benchmark_value": round(benchmark_wealth * capital_value, 2),
+                "coverage": f"{len(available)} / {len(symbols)}",
+                "top_contributors": ", ".join(symbol for symbol, _ in top_contributors),
+            }
+        )
+
+    weight_text = ", ".join(f"{symbol} {weights[symbol]:.1%}" for symbol in symbols[:12])
+    if len(symbols) > 12:
+        weight_text += f", +{len(symbols) - 12} more"
+    methodology = {
+        "universe": weight_text,
+        "benchmark": "Equal-weight basket of the same recommended assets",
+        "model": "Final optimizer-recommended portfolio weights, including ETF/stock mode, capital, horizon, style, market score, climate score, and CVOR proxy.",
+        "rebalance": "Current recommendation held through each historical year for a like-for-like weight test.",
+        "market_data_source": source,
+        "caveat": "This tests today's final recommended portfolio weights against history. It is useful for explaining the recommendation, but it is not a pure historical walk-forward model because past optimizer weights would have been different.",
+    }
+    return rows, recommended_backtest_summary(rows), methodology
 
 
 def run_backtest():
@@ -2419,7 +2623,7 @@ HTML = r"""<!doctype html>
     </section>
 
     <section class="panel" id="backtest-section">
-      <div class="panel-head"><span>Model Backtest</span><span id="backtestTag">Climate-aware vs equal-weight benchmark</span></div>
+      <div class="panel-head"><span>Recommended Portfolio Backtest</span><span id="backtestTag">Final optimizer weights vs same-universe equal weight</span></div>
       <div class="panel-body">
         <div id="backtestSummary" class="metric-strip" style="margin-bottom:10px"></div>
         <canvas id="backtestChart" class="backtest-canvas"></canvas>
@@ -2597,6 +2801,7 @@ async function runOptimizer(){
   const res = await fetch("/api/portfolio_optimizer?"+params.toString());
   OPTIMIZER = await res.json();
   renderOptimizer(OPTIMIZER);
+  renderBacktest(OPTIMIZER);
 }
 
 function renderOptimizer(o){
@@ -2689,7 +2894,16 @@ function renderDashboard(d){
   renderScenarios(d.scenario_rows);
   renderClimateData(d);
   renderDailyClimateSignal(d);
-  renderBacktest(d);
+  renderBacktest({
+    backtest_rows: [],
+    backtest_summary: {},
+    backtest_methodology: {
+      benchmark: "Waiting for optimizer recommendation",
+      model: "The final portfolio optimizer weights will drive this backtest.",
+      rebalance: "Updates after optimizer runs",
+      caveat: "Backtest will update from the final recommended portfolio weights."
+    }
+  });
 }
 
 function renderClimateData(d){
@@ -2763,18 +2977,29 @@ function renderAllocation(rows){
 
 function renderBacktest(d){
   const rows = d.backtest_rows || [];
-  const summary = d.risk_summary || {};
+  const summary = d.backtest_summary || d.risk_summary || {};
   const method = d.backtest_methodology || {};
+  const isRecommended = Boolean(d.backtest_summary) || rows.some(r=>"recommended_return" in r);
+  const modelLabel = isRecommended ? "Recommended portfolio" : "Climate-aware model";
+  const benchLabel = isRecommended ? "Equal-weight same assets" : "Equal-weight benchmark";
+  const modelTotal = summary.recommended_total_return ?? summary.climate_total_return ?? 0;
+  const modelDrawdown = summary.recommended_max_drawdown ?? summary.climate_max_drawdown ?? 0;
+  const wealthRatio = Number(summary.excess_wealth_ratio || 0);
+  const modelWealthValue = r => Number(r.recommended_wealth ?? r.climate_aware_wealth ?? 1);
+  const benchWealthValue = r => Number(r.benchmark_wealth ?? r.equal_weight_wealth ?? 1);
+  const modelReturnValue = r => Number(r.recommended_return ?? r.climate_aware_return ?? 0);
+  const benchReturnValue = r => Number(r.benchmark_return ?? r.equal_weight_return ?? 0);
   const tag = document.getElementById("backtestTag");
-  if(tag) tag.textContent = `${method.benchmark || "Equal-weight benchmark"} | ${method.rebalance || "Annual rebalance"}`;
+  if(tag) tag.textContent = `${method.benchmark || benchLabel} | ${method.rebalance || "Uses final optimizer weights"}`;
 
   const summaryEl = document.getElementById("backtestSummary");
   if(summaryEl){
     summaryEl.innerHTML = [
-      ["Climate total return", fmtPct(summary.climate_total_return || 0), clsFor(summary.climate_total_return || 0)],
+      [`${modelLabel} return`, fmtPct(modelTotal), clsFor(modelTotal)],
       ["Benchmark return", fmtPct(summary.benchmark_total_return || 0), clsFor(summary.benchmark_total_return || 0)],
-      ["Excess wealth", Number(summary.excess_return || 0).toFixed(3) + "x", clsFor(summary.excess_return || 0)],
-      ["Model max drawdown", fmtPct(summary.climate_max_drawdown || 0), "red"],
+      [wealthRatio ? "Model / benchmark" : "Excess ending wealth", wealthRatio ? wealthRatio.toFixed(3) + "x" : Number(summary.excess_return || 0).toFixed(3) + "x", clsFor((wealthRatio || summary.excess_return || 0) - (wealthRatio ? 1 : 0))],
+      ["Model max drawdown", fmtPct(modelDrawdown), "red"],
+      ["Annualized return", fmtPct(summary.annualized_return || 0), clsFor(summary.annualized_return || 0)],
       ["Sharpe proxy", Number(summary.annual_sharpe_proxy || 0).toFixed(2), Number(summary.annual_sharpe_proxy || 0) >= 0 ? "green" : "red"],
       ["Winning years", `${summary.winning_years || 0} / ${summary.years_tested || rows.length}`, "blue"]
     ].map(c=>`<div class="signal-card"><div class="label">${c[0]}</div><div class="value ${c[2]}">${c[1]}</div></div>`).join("");
@@ -2785,10 +3010,16 @@ function renderBacktest(d){
       "backtestChart",
       rows.map(r=>String(r.year)),
       [
-        {name:"Climate-aware model", values:rows.map(r=>r.climate_aware_wealth), color:"#2563eb"},
-        {name:"Equal-weight benchmark", values:rows.map(r=>r.equal_weight_wealth), color:"#64748b"},
+        {name:modelLabel, values:rows.map(modelWealthValue), color:"#2563eb"},
+        {name:benchLabel, values:rows.map(benchWealthValue), color:"#64748b"},
       ]
     );
+  }else{
+    const canvas = document.getElementById("backtestChart");
+    if(canvas){
+      const ctx = canvas.getContext("2d");
+      ctx.clearRect(0,0,canvas.width,canvas.height);
+    }
   }
 
   const metricTable = document.getElementById("backtestMetricTable");
@@ -2798,9 +3029,11 @@ function renderBacktest(d){
       ["Benchmark", method.benchmark || "-"],
       ["Model", method.model || "-"],
       ["Rebalance", method.rebalance || "-"],
-      ["Model total return", fmtPct(summary.climate_total_return || 0)],
+      ["Market data", method.market_data_source || "-"],
+      ["Model total return", fmtPct(modelTotal)],
       ["Benchmark total return", fmtPct(summary.benchmark_total_return || 0)],
-      ["Model max drawdown", fmtPct(summary.climate_max_drawdown || 0)],
+      ["Model / benchmark", wealthRatio ? wealthRatio.toFixed(3) + "x" : "-"],
+      ["Model max drawdown", fmtPct(modelDrawdown)],
       ["Benchmark max drawdown", fmtPct(summary.benchmark_max_drawdown || 0)],
       ["Sharpe proxy", Number(summary.annual_sharpe_proxy || 0).toFixed(3)],
     ];
@@ -2810,15 +3043,15 @@ function renderBacktest(d){
 
   const yearTable = document.getElementById("backtestYearTable");
   if(yearTable){
-    yearTable.innerHTML = `<tr><th>Year</th><th>Regime</th><th>Score</th><th>Model Ret.</th><th>Bench Ret.</th><th>Excess</th><th>Model Wealth</th></tr>` +
+    yearTable.innerHTML = `<tr><th>Year</th><th>Regime</th><th>Coverage / Driver</th><th>Model Ret.</th><th>Bench Ret.</th><th>Excess</th><th>Model Wealth</th></tr>` +
       rows.slice().reverse().map(r=>`<tr>
         <td><b>${r.year}</b></td>
         <td>${r.regime}</td>
-        <td>${Number(r.climate_score || 0).toFixed(2)}</td>
-        <td class="${clsFor(r.climate_aware_return)}">${fmtPct(r.climate_aware_return)}</td>
-        <td class="${clsFor(r.equal_weight_return)}">${fmtPct(r.equal_weight_return)}</td>
+        <td>${r.coverage || Number(r.climate_score || 0).toFixed(2)}<br><span class="hint">${r.top_contributors || "climate score " + Number(r.climate_score || 0).toFixed(2)}</span></td>
+        <td class="${clsFor(modelReturnValue(r))}">${fmtPct(modelReturnValue(r))}</td>
+        <td class="${clsFor(benchReturnValue(r))}">${fmtPct(benchReturnValue(r))}</td>
         <td class="${clsFor(r.return_difference)}">${fmtPct(r.return_difference)}</td>
-        <td>${Number(r.climate_aware_wealth || 0).toFixed(3)}x</td>
+        <td>${modelWealthValue(r).toFixed(3)}x<br><span class="hint">${fmtMoney(r.recommended_value || 0)}</span></td>
       </tr>`).join("");
   }
 
