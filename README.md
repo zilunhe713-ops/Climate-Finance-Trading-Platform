@@ -8,6 +8,7 @@ English U.S.-listed climate-finance research cockpit inspired by the earlier Chi
 - Daily climate-alert overlay that moves current ETF allocation from NWS active weather alerts
 - Climate signal from temperature anomaly and weather disaster frequency proxies
 - Climate-aware vs equal-weight ETF backtest
+- Visible model backtest dashboard with equity curve, risk metrics, annual walk-forward results, and methodology notes
 - Portfolio CVOR scenario matrix
 - Company-level issuer scanner for market CVaR and climate value-at-risk components
 - U.S. listed company search from NasdaqTrader listings

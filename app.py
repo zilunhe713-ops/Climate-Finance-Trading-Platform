@@ -2130,6 +2130,13 @@ def build_payload():
         "latest_allocation": latest_alloc,
         "backtest_rows": backtest_rows,
         "risk_summary": summary,
+        "backtest_methodology": {
+            "universe": ", ".join(SECTOR_ETFS.keys()),
+            "benchmark": "Equal-weight sector ETF basket",
+            "model": "Annual walk-forward climate-aware sector weights from the climate regime engine.",
+            "rebalance": "Annual rebalance using the available climate signal for that year.",
+            "caveat": "Research prototype backtest. It excludes transaction costs, taxes, slippage, borrow cost, and live execution constraints.",
+        },
         "scenario_rows": scenario_rows,
         "cvor_summary": cvor_summary,
         "us_market_notes": US_MARKET_NOTES,
@@ -2184,13 +2191,14 @@ HTML = r"""<!doctype html>
     #quoteTable th,#quoteTable td{padding:9px 7px;font-size:12px;white-space:nowrap}
     #riskTable{min-width:520px}
     #method2Table{min-width:720px}
-    #allocationTable,#optimizerTable,#dailyStockTable,#dailyEtfRecoTable,#dailyAlertTable,#universeTable,#scenarioTable,#climateDataTable,#etfTable,#companyTable,#detailTable,#dailyImpactTable{min-width:860px}
+    #allocationTable,#optimizerTable,#backtestYearTable,#backtestMetricTable,#dailyStockTable,#dailyEtfRecoTable,#dailyAlertTable,#universeTable,#scenarioTable,#climateDataTable,#etfTable,#companyTable,#detailTable,#dailyImpactTable{min-width:860px}
     th,td{padding:8px;border-bottom:1px solid #edf1f7;text-align:left;vertical-align:top}
     th{font-size:12px;color:#52627c;background:#fbfcff}
     tr:hover{background:#f7fbff}
     .compact-table{min-width:620px}
     canvas{width:100%;height:260px;border:1px solid #e1e8f2;border-radius:6px;background:#fff}
     canvas.tall{height:390px}
+    canvas.backtest-canvas{height:300px}
     .log{font-family:Consolas,monospace;background:#0f172a;color:#dbeafe;border-radius:7px;padding:10px;height:150px;overflow:auto;font-size:12px}
     .pill{display:inline-flex;align-items:center;gap:4px;border:1px solid #d7e1ef;border-radius:999px;padding:3px 7px;background:#fff;font-size:11px;margin:2px}
     .pill.high{background:#fff1f1;color:#b42318;border-color:#ffc9c2}
@@ -2254,6 +2262,7 @@ HTML = r"""<!doctype html>
       <a href="#daily-climate-section">Daily Climate <span>Signal</span></a>
       <a href="#climate-section">Climate <span>Live</span></a>
       <a href="#allocation-section">Allocation <span>ETF</span></a>
+      <a href="#backtest-section">Backtest <span>Model</span></a>
       <a href="#optimizer-section">Optimizer <span>Portfolio</span></a>
       <a href="#issuer-section">Issuers <span>Method 2</span></a>
     </nav>
@@ -2406,6 +2415,25 @@ HTML = r"""<!doctype html>
       <div class="panel-head"><span>Portfolio Allocation Dashboard</span><span>Mock $50 million mandate</span></div>
       <div class="panel-body">
         <table id="allocationTable"></table>
+      </div>
+    </section>
+
+    <section class="panel" id="backtest-section">
+      <div class="panel-head"><span>Model Backtest</span><span id="backtestTag">Climate-aware vs equal-weight benchmark</span></div>
+      <div class="panel-body">
+        <div id="backtestSummary" class="metric-strip" style="margin-bottom:10px"></div>
+        <canvas id="backtestChart" class="backtest-canvas"></canvas>
+        <div class="grid two" style="margin-top:10px">
+          <div>
+            <div class="section-title">Backtest Metrics</div>
+            <table id="backtestMetricTable"></table>
+          </div>
+          <div>
+            <div class="section-title">Annual Walk-Forward Results</div>
+            <table id="backtestYearTable"></table>
+          </div>
+        </div>
+        <div id="backtestNote" class="hint" style="margin-top:10px"></div>
       </div>
     </section>
 
@@ -2661,6 +2689,7 @@ function renderDashboard(d){
   renderScenarios(d.scenario_rows);
   renderClimateData(d);
   renderDailyClimateSignal(d);
+  renderBacktest(d);
 }
 
 function renderClimateData(d){
@@ -2730,6 +2759,71 @@ function renderAllocation(rows){
       <td><span class="pill ${r.action.includes("Over")?"ok":(r.action.includes("Under")?"high":"info")}">${r.action}</span></td>
       <td>${r.daily_driver || r.sector_note}<br><span class="hint">${r.sector_note}</span></td>
     </tr>`).join("");
+}
+
+function renderBacktest(d){
+  const rows = d.backtest_rows || [];
+  const summary = d.risk_summary || {};
+  const method = d.backtest_methodology || {};
+  const tag = document.getElementById("backtestTag");
+  if(tag) tag.textContent = `${method.benchmark || "Equal-weight benchmark"} | ${method.rebalance || "Annual rebalance"}`;
+
+  const summaryEl = document.getElementById("backtestSummary");
+  if(summaryEl){
+    summaryEl.innerHTML = [
+      ["Climate total return", fmtPct(summary.climate_total_return || 0), clsFor(summary.climate_total_return || 0)],
+      ["Benchmark return", fmtPct(summary.benchmark_total_return || 0), clsFor(summary.benchmark_total_return || 0)],
+      ["Excess wealth", Number(summary.excess_return || 0).toFixed(3) + "x", clsFor(summary.excess_return || 0)],
+      ["Model max drawdown", fmtPct(summary.climate_max_drawdown || 0), "red"],
+      ["Sharpe proxy", Number(summary.annual_sharpe_proxy || 0).toFixed(2), Number(summary.annual_sharpe_proxy || 0) >= 0 ? "green" : "red"],
+      ["Winning years", `${summary.winning_years || 0} / ${summary.years_tested || rows.length}`, "blue"]
+    ].map(c=>`<div class="signal-card"><div class="label">${c[0]}</div><div class="value ${c[2]}">${c[1]}</div></div>`).join("");
+  }
+
+  if(rows.length){
+    drawLineChart(
+      "backtestChart",
+      rows.map(r=>String(r.year)),
+      [
+        {name:"Climate-aware model", values:rows.map(r=>r.climate_aware_wealth), color:"#2563eb"},
+        {name:"Equal-weight benchmark", values:rows.map(r=>r.equal_weight_wealth), color:"#64748b"},
+      ]
+    );
+  }
+
+  const metricTable = document.getElementById("backtestMetricTable");
+  if(metricTable){
+    const metrics = [
+      ["Universe", method.universe || "-"],
+      ["Benchmark", method.benchmark || "-"],
+      ["Model", method.model || "-"],
+      ["Rebalance", method.rebalance || "-"],
+      ["Model total return", fmtPct(summary.climate_total_return || 0)],
+      ["Benchmark total return", fmtPct(summary.benchmark_total_return || 0)],
+      ["Model max drawdown", fmtPct(summary.climate_max_drawdown || 0)],
+      ["Benchmark max drawdown", fmtPct(summary.benchmark_max_drawdown || 0)],
+      ["Sharpe proxy", Number(summary.annual_sharpe_proxy || 0).toFixed(3)],
+    ];
+    metricTable.innerHTML = `<tr><th>Metric</th><th>Value</th></tr>` +
+      metrics.map(r=>`<tr><td><b>${r[0]}</b></td><td>${r[1]}</td></tr>`).join("");
+  }
+
+  const yearTable = document.getElementById("backtestYearTable");
+  if(yearTable){
+    yearTable.innerHTML = `<tr><th>Year</th><th>Regime</th><th>Score</th><th>Model Ret.</th><th>Bench Ret.</th><th>Excess</th><th>Model Wealth</th></tr>` +
+      rows.slice().reverse().map(r=>`<tr>
+        <td><b>${r.year}</b></td>
+        <td>${r.regime}</td>
+        <td>${Number(r.climate_score || 0).toFixed(2)}</td>
+        <td class="${clsFor(r.climate_aware_return)}">${fmtPct(r.climate_aware_return)}</td>
+        <td class="${clsFor(r.equal_weight_return)}">${fmtPct(r.equal_weight_return)}</td>
+        <td class="${clsFor(r.return_difference)}">${fmtPct(r.return_difference)}</td>
+        <td>${Number(r.climate_aware_wealth || 0).toFixed(3)}x</td>
+      </tr>`).join("");
+  }
+
+  const note = document.getElementById("backtestNote");
+  if(note) note.textContent = method.caveat || "Research prototype backtest.";
 }
 
 function renderMethod2(m){
