@@ -2216,6 +2216,12 @@ HTML = r"""<!doctype html>
     .signal-card{border:1px solid #dbe3ef;border-radius:8px;background:#fff;padding:10px;min-height:70px}
     .signal-card .label{color:var(--muted);font-size:11px;font-weight:750}
     .signal-card .value{font-size:20px;font-weight:850;margin-top:4px}
+    .metric-strip{display:flex;gap:8px;overflow-x:auto;overflow-y:hidden;padding:2px 2px 10px;scroll-snap-type:x proximity;scrollbar-gutter:stable}
+    .metric-strip .signal-card{flex:0 0 188px;scroll-snap-align:start}
+    .metric-strip::-webkit-scrollbar{height:8px}
+    .metric-strip::-webkit-scrollbar-track{background:#eef3f9;border-radius:999px}
+    .metric-strip::-webkit-scrollbar-thumb{background:#b9c7da;border-radius:999px}
+    .metric-strip::-webkit-scrollbar-thumb:hover{background:#8fa3bd}
     .data-note{display:flex;gap:8px;align-items:center;flex-wrap:wrap;color:var(--muted);font-size:12px}
     .side-nav{display:grid;gap:6px;margin-bottom:12px}
     .side-nav a{display:flex;align-items:center;justify-content:space-between;text-decoration:none;color:#25324a;border:1px solid #dbe3ef;border-radius:7px;padding:8px 9px;background:#fbfdff;font-weight:750}
@@ -2378,7 +2384,7 @@ HTML = r"""<!doctype html>
       <div class="panel">
         <div class="panel-head"><span>Current Climate Data</span><span>NWS + NASA/NOAA/NCEI</span></div>
         <div class="panel-body">
-          <div id="dailyClimateCards" class="grid four"></div>
+          <div id="dailyClimateCards" class="metric-strip" aria-label="Scrollable current climate data cards"></div>
           <div class="data-note" style="margin:10px 0 4px">
             <span class="pill info">Daily alerts</span>
             <span class="pill info">Temperature</span>
